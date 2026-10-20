@@ -559,6 +559,8 @@ Alpha/
 ├── logs/                              # 日志文件
 ├── start.sh / stop.sh / restart.sh    # 服务管理脚本（macOS / Linux）
 ├── start.ps1 / stop.ps1 / restart.ps1 # 服务管理脚本（Windows PowerShell）
+├── set-llm.ps1                        # 一键配置 OpenAI 兼容 LLM 端点（Windows）
+├── scripts/test_llm.py                # LLM 端点连通性自检
 ├── README-WINDOWS.md                  # Windows 裸机部署说明
 ├── Dockerfile                         # 容器镜像（CPU 版 Torch；基础+Kronos+MCP 依赖档位）
 ├── docker-compose.yml                 # 一键部署（env_file + data/logs volume + healthcheck）
@@ -608,6 +610,15 @@ python -m venv .venv
 ```
 
 默认访问 http://127.0.0.1:18890。环境变量仍从 `.env` 读取（`PORT` / `HOST` / `RELOAD` 等），详细说明见 [README-WINDOWS.md](README-WINDOWS.md)。
+
+#### LLM 接入（任意 OpenAI 兼容服务）
+
+Alpha 的 LLM 调用统一走 OpenAI 兼容协议，默认优先 `POST {base}/chat/completions`，端点不支持时自动回退 `POST {base}/responses`（同时兼容不认 `response_format` 的服务）。因此 DeepSeek、通义千问（DashScope 兼容模式）、智谱 GLM、SiliconFlow、OpenAI 官方、LM Studio、llama.cpp server、vLLM 都能直接接入：
+
+```powershell
+.\set-llm.ps1 -Provider deepseek -ApiKey sk-xxxx -Restart -Test   # 写入 .env + 重启 + 自检
+.\.venv\Scripts\python.exe scripts\test_llm.py                       # 仅做连通性自检
+```
 
 ### Docker 部署（推荐新手）
 

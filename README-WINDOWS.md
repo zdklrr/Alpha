@@ -51,12 +51,38 @@ HOST=127.0.0.1
 RELOAD=0
 ENABLE_TUSHARE=false        # 不填 Token 也可用东财/新浪免费源
 ENABLE_LIVE_MARKET_DATA=true
-OPENAI_API_KEY=ollama       # 需要 LLM 打分/Hermes 时再启 Ollama，否则可留空
-OPENAI_BASE_URL=http://127.0.0.1:11434/v1
-HERMES_MODEL=qwen2.5:7b
+# LLM 三项默认注释掉（未配置 LLM 时公告打分/Hermes 面板会提示未启用，主功能不受影响）
+# OPENAI_API_KEY=sk-xxxxxxxx
+# OPENAI_BASE_URL=https://api.deepseek.com/v1
+# HERMES_MODEL=deepseek-chat
 ```
 
-- 需要 LLM 功能时：安装 Ollama → `ollama serve` → `ollama pull qwen2.5:7b`
+### 3.1 配置 LLM（可选，非 Ollama 也可）
+
+Alpha 的 LLM 全部走 **OpenAI 兼容协议**，所以任何兼容服务都能接：DeepSeek、通义千问（DashScope 兼容模式）、智谱 GLM、SiliconFlow、OpenAI 官方、LM Studio、llama.cpp server、vLLM。
+
+一键配置（写入 `.env` + 重启 + 连通性自检）：
+
+```powershell
+cd G:\Alpha选股
+
+.\set-llm.ps1 -Provider deepseek    -ApiKey sk-xxxx -Restart -Test
+.\set-llm.ps1 -Provider qwen        -ApiKey sk-xxxx -Model qwen-plus -Restart -Test
+.\set-llm.ps1 -Provider glm         -ApiKey xxxxxxxx -Model glm-4-flash -Restart -Test
+.\set-llm.ps1 -Provider siliconflow -ApiKey sk-xxxx -Restart -Test
+.\set-llm.ps1 -Provider openai      -ApiKey sk-xxxx -Restart -Test
+.\set-llm.ps1 -Provider lmstudio    -Model <本地模型名> -Restart -Test
+.\set-llm.ps1 -Provider custom      -BaseUrl http://127.0.0.1:8000/v1 -ApiKey local -Model my-model -Restart -Test
+```
+
+只做连通性自检（不改配置）：
+
+```powershell
+.\.venv\Scripts\python.exe scripts\test_llm.py
+```
+
+> 兼容说明：服务优先调用 `POST {base}/chat/completions`，若端点不支持（404/405）自动回退 `POST {base}/responses`；部分不认 `response_format` 的服务会自动去掉该参数重试。模型返回带 ```json 包裹或前后缀说明文字也能正确解析。
+
 - 需要飞书通知时：填 `FEISHU_WEBHOOK_URL`
 - `.env` 已被 `.gitignore` 忽略，不要把真实 Token 提交到 Git
 
