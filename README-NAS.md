@@ -3,6 +3,35 @@
 本文档对应仓库里的 `docker-compose.nas.yml` / `.env.nas.template` / `deploy-nas.sh`。
 宿主机端口 **923**（即 0923），容器内 18888。
 
+## 本次实际部署记录（2026-10-20，已上线）
+
+| 项 | 值 |
+| --- | --- |
+| NAS | 群晖 DSM，192.168.31.94（x86_64，Docker 24.0.2 + compose v2.20.1） |
+| 部署目录 | `/volume1/docker/Alpha` |
+| 容器 | `alpha`（镜像 `alpha:zdklrr`，`restart: unless-stopped`，健康检查通过） |
+| 访问地址 | <http://192.168.31.94:923/>（局域网内） |
+| 命名卷 | `alpha_data`（SQLite 库）、`alpha_hf_cache`（Kronos 权重） |
+| 行情数据 | 已从本机迁移 967,146 行日线（`kline_daily`），无需重新初始化 |
+| 写令牌 | 存放在 `/volume1/docker/Alpha/.env` 的 `ALPHA_WRITE_TOKEN` |
+
+验证结果（部署当时）：
+
+- `GET /` → 200；`/api/market/hot-stocks` → 200（5024 行实时行情，NAS 出口直连行情源正常）
+- `/api/funnel`、`/api/strategy/rules`、`/api/predict/kronos/status` → 200
+- 写接口鉴权生效：不带 `X-Alpha-Token` → 403，带正确 token → 200
+- `docker restart alpha` 后自动恢复，K 线行数仍为 967,146
+
+> **compose 文件名**：仓库自带 `docker-compose.nas.yml`；为了让群晖 Container Manager 的
+> 「项目」功能能直接识别，部署时把它复制成了 `docker-compose.yml`（原仓库的
+> `docker-compose.yml` 保留为 `docker-compose.upstream.yml`）。
+> `deploy-nas.sh` 会自动按「有 `docker-compose.yml` 就用它」的规则选择。
+> 容器是用命令行创建的，DSM 界面里请在「容器」页管理；若要改成 UI「项目」方式，
+> 先 `docker compose down` 再新建项目，避免 `container_name: alpha` 冲突。
+
+> **日志目录**：`./logs` 是 bind mount，宿主机上必须先存在，`deploy-nas.sh` 已自动 `mkdir -p logs`。
+
+
 ## 0. 前置
 
 - NAS 已装 Docker（群晖 Container Manager / 威联通 Container Station / 斐乐纳 Docker 应用均可）。
@@ -85,8 +114,11 @@ docker compose -f docker-compose.nas.yml logs -f --tail 100
 
 ```bash
 curl -X POST "http://127.0.0.1:923/api/jobs/kline-cache/initialize?window_days=120" \
-     -H "X-Alpha-Write-Token: <你的 ALPHA_WRITE_TOKEN>"
+     -H "X-Alpha-Token: <你的 ALPHA_WRITE_TOKEN>"
 ```
+
+> 请求头名是 **`X-Alpha-Token`**（不是 `X-Alpha-Write-Token`），见 `app/main.py` 的
+> `access_guard` 中间件。
 
 耗时参考：本机实测 5022 只标的约 **17 分钟**（腾讯源限速 5 req/s，零失败）。
 若 NAS 出口被行情源限流/403，失败率会升高；查看日志 `docker compose logs -f | grep -i "failed"`。
@@ -96,21 +128,24 @@ curl -X POST "http://127.0.0.1:923/api/jobs/kline-cache/initialize?window_days=1
 本机已有 967,146 行 K 线（`data/market_kline.db`，218MB）。要迁移：
 
 ```powershell
-# Windows 本机
+# Windows 本机（先把 WAL checkpoint 掉，保证 .db 本身是完整的）
 cd G:\Alpha选股
-scp data\market_kline.db user@<NAS_IP>:/tmp/market_kline.db
+.venv\Scripts\python.exe -c "import sqlite3;c=sqlite3.connect('data/market_kline.db');c.execute('PRAGMA wal_checkpoint(TRUNCATE)');c.close()"
+scp data\market_kline.db user@<NAS_IP>:/volume1/docker/Alpha/import_market_kline.db
 ```
 
 ```bash
-# NAS 上：先停容器再覆盖命名卷里的库
+# NAS 上：停容器 → 清掉旧库 → 拷进命名卷 → 再启动
 cd <你的 docker 目录>/Alpha
-docker compose -f docker-compose.nas.yml stop
-docker run --rm -v alpha_data:/d -v /tmp:/src alpine \
-  sh -c "rm -f /d/market_kline.db* && cp /src/market_kline.db /d/market_kline.db && chown 999:999 /d/market_kline.db"
-docker compose -f docker-compose.nas.yml start
+docker compose -f docker-compose.yml stop
+docker exec alpha rm -f /app/data/market_kline.db /app/data/market_kline.db-wal /app/data/market_kline.db-shm
+docker cp import_market_kline.db alpha:/app/data/market_kline.db
+docker compose -f docker-compose.yml start
+rm -f import_market_kline.db   # 拷完删掉，省 218MB
 ```
 
 > ⚠️ 覆盖前建议先 `docker compose cp alpha:/app/data/market_kline.db ./backup.db` 备份。
+> 覆盖必须在容器**停止**状态下做，运行中替换文件会破坏 SQLite 的 WAL 一致性。
 
 ## 5. 日常运维
 
