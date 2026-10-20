@@ -144,7 +144,7 @@ Alpha 是一个面向 A 股市场的**自进化量化选股系统**。它不只�
 - **任务历史**：分页展示，支持按状态筛选（全部/成功/失败/运行中）
 - **完整性报告**：按日期展示缺失分布，最差个股排名
 - **自动同步**：每日 15:20 自动补最新交易日缺口；配置 Token 时以 Tushare 提供股票主数据、交易日历和日线，未配置或调用失败时显式降级东财 / 新浪；实时行情固定走东财，历史全量补缺仅由手动按钮触发
-- **来源可追溯**：K 线与同步明细持久化 `source` / `fallback_reason`，可区分 `tushare`、`eastmoney`、`sina`、`sqlite` 与具体降级原因
+- **来源可追溯**：K 线与同步明细持久化 `source` / `fallback_reason`，可区分 `tushare`、`eastmoney`、`tencent`、`sina`、`sqlite` 与具体降级原因
 
 ### 数据源与格式
 
@@ -152,10 +152,17 @@ Alpha 是一个面向 A 股市场的**自进化量化选股系统**。它不只�
 |------|------|--------|----------------|
 | 股票主数据 | Tushare `stock_basic` | 东方财富全市场 spot | `symbol -> name`，股票代码统一为 6 位字符串 |
 | 交易日历 | Tushare `trade_cal` | Sina，最后使用新鲜 SQLite 日期 | `YYYY-MM-DD` |
-| 历史/日线 | Tushare `daily` / `pro_bar` | 东方财富 K 线 | SQLite：`symbol, trade_date, open, high, low, close, volume, amount, source, fallback_reason` |
+| 历史/日线 | Tushare `daily` / `pro_bar` | 东方财富 K 线 → 腾讯 K 线 | SQLite：`symbol, trade_date, open, high, low, close, volume, amount, source, fallback_reason` |
 | 实时行情 | 东方财富 spot | 业务层既有降级路径 | Pandas DataFrame 中文列名；FastAPI 对外返回 JSON |
 
 Tushare `daily.vol` 以“手”为单位，直接映射为 `volume`；`daily.amount` 以“千元”为单位，写入 Alpha 前乘以 1000，统一为人民币“元”。策略产物仍按各模块使用 CSV / JSON，Kronos 输入使用英文 OHLCVA DataFrame。
+
+**东财不可用时的自动降级**：部分网络环境（机房 IP、被限速的出口）会整段拒绝东方财富 `/api/qt/*` 接口（HTTP 403）。此时 `EastmoneyMarketDataClient` 会自动切到腾讯日 K 备用源：
+
+- 连续 3 次东财失败后熔断 600 秒，期间不再重复请求东财；
+- 腾讯侧多域名轮换（`ifzq.gtimg.cn` → `web.ifzq.gtimg.cn` → `proxy.finance.qq.com`），全局限速 5 次/秒，单域名连续失败 2 次冷却 300 秒，规避腾讯反爬 501；
+- 腾讯接口不返回成交额，Alpha 用 `收盘 × 成交量(手) × 100` 估算；成交量单位统一折算为“手”（科创板 688/689 上游返回“股”）；
+- 落库时标记 `source=tencent`、`fallback_reason=eastmoney_unavailable`，可在数据中心按来源区分与回溯。
 
 ### 3. 策略选股
 
@@ -550,7 +557,9 @@ Alpha/
 │       ├── sequence_model.py          # GRU 时序模型
 │       └── train_sequence.py          # 时序训练入口
 ├── logs/                              # 日志文件
-├── start.sh / stop.sh / restart.sh    # 服务管理脚本
+├── start.sh / stop.sh / restart.sh    # 服务管理脚本（macOS / Linux）
+├── start.ps1 / stop.ps1 / restart.ps1 # 服务管理脚本（Windows PowerShell）
+├── README-WINDOWS.md                  # Windows 裸机部署说明
 ├── Dockerfile                         # 容器镜像（CPU 版 Torch；基础+Kronos+MCP 依赖档位）
 ├── docker-compose.yml                 # 一键部署（env_file + data/logs volume + healthcheck）
 ├── .dockerignore                      # 镜像构建排除（.git/data/logs/tests 等）
@@ -585,6 +594,20 @@ CI 使用 `requirements-ci.txt` 执行基础单元/API 回归；只有模型代�
 ```
 
 打开浏览器访问 http://127.0.0.1:18890。默认端口为 18890，可通过 `PORT=xxxx ./start.sh` 覆盖；如果端口被不可用的旧进程占用，`start.sh` 会直接失败并提示先释放端口。
+
+### Windows 裸机部署
+
+仓库自带的 `start.sh / stop.sh / restart.sh` 面向 macOS/Linux（依赖 `bash`、`ps -o stat`、`lsof`，并强制 arm64 Python）。Windows 下使用等价的 PowerShell 脚本：
+
+```powershell
+python -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -r requirements-base.txt -r requirements-training.txt -r requirements-mcp.txt
+.\start.ps1          # 后台启动（首次启动含行情预热，约 40–60 秒）
+.\stop.ps1           # 先做 SQLite WAL checkpoint 再停进程
+.\restart.ps1        # 重启
+```
+
+默认访问 http://127.0.0.1:18890。环境变量仍从 `.env` 读取（`PORT` / `HOST` / `RELOAD` 等），详细说明见 [README-WINDOWS.md](README-WINDOWS.md)。
 
 ### Docker 部署（推荐新手）
 

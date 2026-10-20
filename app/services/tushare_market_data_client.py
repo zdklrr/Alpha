@@ -128,10 +128,16 @@ class TushareFirstMarketDataClient:
             except Exception as exc:
                 fallback_reason = f"tushare_error:{type(exc).__name__}"
         frame = await self.fallback.fetch_hist(symbol, start_date, end_date, adjust=adjust)
+        # 备用源可能继续降级（如东财 403 时切腾讯），来源与降级原因需如实透传，
+        # 否则落库的 source 会与真实数据源不一致。
+        source = str(frame.attrs.get("data_source") or "eastmoney")
+        inner_reason = str(frame.attrs.get("fallback_reason") or "")
+        if inner_reason:
+            fallback_reason = f"{fallback_reason}; {inner_reason}" if fallback_reason else inner_reason
         return self._mark(
             frame,
             operation="daily_history",
-            source="eastmoney",
+            source=source,
             fallback_reason=fallback_reason,
         )
 

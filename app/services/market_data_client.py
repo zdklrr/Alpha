@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import datetime as _dt
 import re
+import time
 from typing import Any
 
 import httpx
@@ -63,6 +64,19 @@ class EastmoneyMarketDataClient:
         "https://push2.eastmoney.com/api/qt/clist/get",
     )
     TRADE_DAYS_URL = "https://finance.sina.com.cn/realstock/company/klc_td_sh.txt"
+    TENCENT_KLINE_URLS = (
+        "https://ifzq.gtimg.cn/appstock/app/fqkline/get",
+        "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get",
+        "https://proxy.finance.qq.com/ifzqgtimg/appstock/app/newfqkline/get",
+    )
+    # 东财 api/qt 路径在部分网络环境会整段 403；连续失败后先走腾讯备用源，
+    # 避免每个标的都把超时/重试时间耗满（整轮同步会慢一个数量级）。
+    EM_FAILURE_THRESHOLD = 3
+    EM_COOLDOWN_SECONDS = 600.0
+    # 腾讯接口对高频访问会返回 501 反爬页面：全局限速 + 单域名连续失败后冷却。
+    TENCENT_MIN_INTERVAL = 0.2
+    TENCENT_HOST_COOLDOWN = 300.0
+    TENCENT_HOST_FAIL_LIMIT = 2
 
     def __init__(
         self,
@@ -76,6 +90,12 @@ class EastmoneyMarketDataClient:
         self.timeout = timeout or httpx.Timeout(connect=2.0, read=8.0, write=2.0, pool=2.0)
         self.retries = max(0, int(retries))
         self.transport = transport
+        self._em_fail_streak = 0
+        self._em_blocked_until = 0.0
+        self._tencent_host_fails: dict[str, int] = {}
+        self._tencent_host_blocked: dict[str, float] = {}
+        self._tencent_lock: asyncio.Lock | None = None
+        self._tencent_last_request = 0.0
         self._headers = {
             "User-Agent": (
                 "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
@@ -148,18 +168,24 @@ class EastmoneyMarketDataClient:
             return pd.DataFrame()
 
         payload: dict[str, Any] = {}
-        async with self._client() as client:
-            for url in self.HIST_URLS:
-                payload = await self._get_json(client, url, params)
-                data = payload.get("data") if isinstance(payload, dict) else None
-                klines = data.get("klines") if isinstance(data, dict) else None
-                if klines:
-                    break
+        em_available = self._eastmoney_available()
+        if em_available:
+            async with self._client() as client:
+                for url in self.HIST_URLS:
+                    payload = await self._get_json(client, url, params)
+                    data = payload.get("data") if isinstance(payload, dict) else None
+                    klines = data.get("klines") if isinstance(data, dict) else None
+                    if klines:
+                        self._eastmoney_ok()
+                        break
+                else:
+                    self._eastmoney_failed()
 
         data = payload.get("data") if isinstance(payload, dict) else None
         klines = data.get("klines") if isinstance(data, dict) else None
         if not klines:
-            return pd.DataFrame()
+            # 东财不可用（403/超时）→ 走腾讯备用源，保证整轮同步能拿到 K 线
+            return await self._fetch_hist_tencent(clean_symbol, start_date, end_date, adjust)
 
         rows: list[list[str]] = []
         for item in klines:
@@ -182,6 +208,153 @@ class EastmoneyMarketDataClient:
         out = out.reset_index(drop=True)
         out.attrs["data_source"] = "eastmoney"
         out.attrs["fallback_reason"] = ""
+        return out
+
+    # ------------------------------------------------------------------
+    # 东财可用性熔断 + 腾讯备用数据源
+    # ------------------------------------------------------------------
+    def _eastmoney_available(self) -> bool:
+        if self._em_fail_streak < self.EM_FAILURE_THRESHOLD:
+            return True
+        return time.monotonic() >= self._em_blocked_until
+
+    def _eastmoney_failed(self) -> None:
+        self._em_fail_streak += 1
+        if self._em_fail_streak >= self.EM_FAILURE_THRESHOLD:
+            self._em_blocked_until = time.monotonic() + self.EM_COOLDOWN_SECONDS
+            print(
+                "[market_data_client] eastmoney kline unavailable, "
+                f"fallback to tencent for {self.EM_COOLDOWN_SECONDS:.0f}s"
+            )
+
+    def _eastmoney_ok(self) -> None:
+        self._em_fail_streak = 0
+        self._em_blocked_until = 0.0
+
+    def _tencent_hosts(self) -> list[str]:
+        now = time.monotonic()
+        hosts = [
+            url
+            for url in self.TENCENT_KLINE_URLS
+            if self._tencent_host_blocked.get(url, 0.0) <= now
+        ]
+        return hosts or list(self.TENCENT_KLINE_URLS[:1])
+
+    def _tencent_host_failed(self, url: str) -> None:
+        fails = self._tencent_host_fails.get(url, 0) + 1
+        self._tencent_host_fails[url] = fails
+        if fails >= self.TENCENT_HOST_FAIL_LIMIT:
+            self._tencent_host_blocked[url] = time.monotonic() + self.TENCENT_HOST_COOLDOWN
+            self._tencent_host_fails[url] = 0
+            print(f"[market_data_client] tencent host cooled down: {url}")
+
+    def _tencent_host_ok(self, url: str) -> None:
+        self._tencent_host_fails[url] = 0
+
+    async def _tencent_throttle(self) -> None:
+        if self._tencent_lock is None:
+            self._tencent_lock = asyncio.Lock()
+        async with self._tencent_lock:
+            elapsed = time.monotonic() - self._tencent_last_request
+            wait = self.TENCENT_MIN_INTERVAL - elapsed
+            if wait > 0:
+                await asyncio.sleep(wait)
+            self._tencent_last_request = time.monotonic()
+
+    @staticmethod
+    def _tencent_symbol(clean_symbol: str) -> str:
+        if clean_symbol.startswith(("6", "9", "5")):
+            return f"sh{clean_symbol}"
+        if clean_symbol.startswith(("4", "8")):
+            return f"bj{clean_symbol}"
+        return f"sz{clean_symbol}"
+
+    @staticmethod
+    def _tencent_date(value: str) -> str:
+        text = _yyyymmdd(value)
+        if not text:
+            return ""
+        return f"{text[:4]}-{text[4:6]}-{text[6:8]}"
+
+    @staticmethod
+    def _tencent_count(start_date: str, end_date: str) -> int:
+        try:
+            days = (
+                _dt.date.fromisoformat(end_date) - _dt.date.fromisoformat(start_date)
+            ).days
+        except Exception:
+            days = 120
+        return int(max(30, min(640, days + 20)))
+
+    async def _fetch_hist_tencent(
+        self,
+        clean_symbol: str,
+        start_date: str,
+        end_date: str,
+        adjust: str = "qfq",
+    ) -> pd.DataFrame:
+        """腾讯备用源日 K（多域名轮换 + 限速 + 失败冷却）。
+
+        返回与东财一致的中文列结构；腾讯不返回成交额，这里用
+        收盘价 × 成交量(手) × 100 估算，供下游成交额类因子使用。
+        """
+        sym = self._tencent_symbol(clean_symbol)
+        fq = {"qfq": "qfq", "hfq": "hfq"}.get(str(adjust or "").lower(), "")
+        begin = self._tencent_date(start_date)
+        finish = self._tencent_date(end_date)
+        if not begin or not finish:
+            return pd.DataFrame()
+        count = self._tencent_count(begin, finish)
+        params = {"param": f"{sym},day,{begin},{finish},{count},{fq}"}
+
+        payload: dict[str, Any] = {}
+        for url in self._tencent_hosts():
+            await self._tencent_throttle()
+            try:
+                async with self._client() as client:
+                    payload = await self._get_json(client, url, params)
+            except Exception as exc:  # pragma: no cover - defensive
+                print(f"[market_data_client] tencent GET failed: {url} ({exc})")
+                payload = {}
+            if payload:
+                self._tencent_host_ok(url)
+                break
+            self._tencent_host_failed(url)
+        if not payload:
+            return pd.DataFrame()
+
+        data = payload.get("data") if isinstance(payload, dict) else None
+        node = data.get(sym) if isinstance(data, dict) else None
+        if not isinstance(node, dict):
+            return pd.DataFrame()
+        key = f"{fq}day" if fq else "day"
+        items = node.get(key) or node.get("day") or []
+        rows: list[list[str]] = []
+        for item in items:
+            if isinstance(item, (list, tuple)) and len(item) >= 6:
+                rows.append(list(item))
+        if not rows:
+            return pd.DataFrame()
+
+        out = pd.DataFrame()
+        out["日期"] = (
+            pd.to_datetime(pd.Series([r[0] for r in rows]), errors="coerce")
+            .dt.date.astype(str)
+        )
+        out["开盘"] = pd.to_numeric(pd.Series([r[1] for r in rows]), errors="coerce").fillna(0.0)
+        out["收盘"] = pd.to_numeric(pd.Series([r[2] for r in rows]), errors="coerce").fillna(0.0)
+        out["最高"] = pd.to_numeric(pd.Series([r[3] for r in rows]), errors="coerce").fillna(0.0)
+        out["最低"] = pd.to_numeric(pd.Series([r[4] for r in rows]), errors="coerce").fillna(0.0)
+        out["成交量"] = pd.to_numeric(pd.Series([r[5] for r in rows]), errors="coerce").fillna(0.0)
+        # 腾讯日 K 的成交量单位：主板/创业板为「手」，科创板(688/689)为「股」。
+        # 统一折算成「手」，与东财口径保持一致。
+        if clean_symbol.startswith(("688", "689")):
+            out["成交量"] = out["成交量"] / 100.0
+        out["成交额"] = (out["收盘"] * out["成交量"] * 100.0).round(2)
+        out = out[out["日期"].ne("NaT")]
+        out = out.reset_index(drop=True)
+        out.attrs["data_source"] = "tencent"
+        out.attrs["fallback_reason"] = "eastmoney_unavailable"
         return out
 
     async def fetch_spot(self) -> pd.DataFrame:
@@ -307,10 +480,18 @@ class EastmoneyMarketDataClient:
         dates: list[str] = []
         try:
             from akshare.stock.cons import hk_js_decode
-            from py_mini_racer import py_mini_racer
+
+            # mini-racer >= 0.12 exports MiniRacer at package top level, while the
+            # legacy py-mini-racer wheel exposes the py_mini_racer submodule.
+            try:
+                from py_mini_racer import MiniRacer
+            except ImportError:  # pragma: no cover - legacy layout
+                from py_mini_racer import py_mini_racer as _py_mini_racer
+
+                MiniRacer = _py_mini_racer.MiniRacer
 
             encoded = text.split("=", 1)[1].split(";", 1)[0].replace('"', "")
-            js_code = py_mini_racer.MiniRacer()
+            js_code = MiniRacer()
             js_code.eval(hk_js_decode)
             decoded = js_code.call("d", encoded)
             dates = [_iso_date(str(item)) for item in decoded]
