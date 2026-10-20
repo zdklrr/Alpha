@@ -110,3 +110,34 @@ Alpha选股/
 ├── logs/                 # 服务日志 server-<port>.log（运行时生成）
 └── data/                 # SQLite 数据库与缓存（运行时生成）
 ```
+
+---
+
+## 8. 数据源降级（东方财富 403）
+
+部分出口 IP（机房、被限速的代理出口）会被东方财富整段 `/api/qt/*` 接口拒绝，返回 **403 Forbidden**。
+本项目已内置自动降级：
+
+- 东财 K 线连续失败 3 次 → 熔断 600 秒，期间直接走备用源；
+- 备用源为**腾讯日 K**（`ifzq.gtimg.cn` → `web.ifzq.gtimg.cn` → `proxy.finance.qq.com` 三域名轮换），
+  全局限速 5 次/秒，单域名连续失败 2 次冷却 300 秒，规避腾讯 501 反爬；
+- 腾讯不返回成交额，按 `收盘 × 成交量(手) × 100` 估算；成交量统一折算为「手」（科创板 688/689 上游返回「股」）；
+- 落库时 `source=tencent`、`fallback_reason` 记录降级原因，可在「数据中心」按来源回溯。
+
+手动验证当前实际使用的源：
+
+```powershell
+.\.venv\Scripts\python.exe -c "import sqlite3;c=sqlite3.connect('data/market_kline.db');print(c.execute('select source,count(*) from kline_daily group by source').fetchall())"
+```
+
+## 9. 本机验证结果（2026-10-20）
+
+| 项目 | 结果 |
+|------|------|
+| 服务地址 | <http://127.0.0.1:18890/>（`/` 返回 200，标题 Alpha，页面 JS 报错数 0） |
+| K 线一键初始化 | `5022/5022` 成功，`0` 失败，耗时约 17 分钟，进度 100% |
+| K 线缓存 | `data/market_kline.db` 共 967,146 行 / 5,026 只 / 覆盖 2025-11-06 ~ 2026-10-20 |
+| 接口自检 | `/api/funnel`、`/api/market/hot-stocks`（5024 条）、`/api/strategy/rules`、`/api/predict/kronos/status` 均 200 |
+| 单元测试 | `pytest tests/test_market_data_client.py tests/test_kline_cache_service.py tests/test_tushare_market_data_client.py -q` → 10 passed |
+| 漏斗三池为空 | 属正常：本地 `funnel_state.db` 为全新空库，候选池需要盘中扫描 / 上游种子数据才会填充 |
+
